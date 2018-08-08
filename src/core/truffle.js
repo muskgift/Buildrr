@@ -9,6 +9,9 @@ const glob = util.promisify(require("glob"));
 const TruffleContract = importLazy("truffle-contract");
 const { BuidlerError, ERRORS } = require("./errors");
 
+const DEFAULT_INSTANCE_METHODS_TO_OVERRIDE = ["sendTransaction"];
+const DEFAULT_GAS_MULTIPLIER = 1.5;
+
 class TruffleArtifactsStorage {
   constructor(artifactsPath) {
     this._artifactsPath = artifactsPath;
@@ -84,6 +87,22 @@ class LazyTruffleContractProvisioner {
     Contract.setProvider(this._web3.currentProvider);
     this._addContractDeploymentGasEstimation(Contract);
     this._addDefaultParamsHooks(Contract);
+  }
+
+  async _addInstanceFunctionGasEstimation(
+    instance,
+    methodName,
+    argsWithTxArgs
+  ) {
+
+    const [txArgs] = argsWithTxArgs.slice(-1);
+
+    if (txArgs.gas !== undefined) {
+      return;
+    }
+
+    const gas = await instance[methodName].estimateGas(...argsWithTxArgs);
+    txArgs.gas = gas;
   }
 
   _addContractDeploymentGasEstimation(Contract) {
@@ -163,8 +182,6 @@ class LazyTruffleContractProvisioner {
   }
 
   _getContractInstanceMethodsToOverride(Contract) {
-    const DEFAULT_INSTANCE_METHODS_TO_OVERRIDE = ["sendTransaction"];
-
     const abiFunctions = Contract.abi
       .filter(item => item.type === "function")
       .map(item => item.name);
@@ -175,21 +192,36 @@ class LazyTruffleContractProvisioner {
   _addDefaultParamsToInstanceMethod(Contract, instance, methodName) {
     const original = instance[methodName];
     const originalCall = original.call;
-    const originalEstimateGas = original.estimateGas;
 
     instance[methodName] = async (...args) => {
       await this._ensureTxParamsWithDefaults(Contract, args);
+      await this._addInstanceFunctionGasEstimation(instance, methodName, args);
+      console.log("Limit", methodName,args[args.length - 1].gas);
       return original.apply(instance, args);
     };
 
     instance[methodName].call = async (...args) => {
       await this._ensureTxParamsWithDefaults(Contract, args);
+      await this._addInstanceFunctionGasEstimation(instance, methodName, args);
       return originalCall.apply(originalCall, args);
     };
 
     instance[methodName].estimateGas = async (...args) => {
       await this._ensureTxParamsWithDefaults(Contract, args);
-      return originalEstimateGas.apply(originalEstimateGas, args);
+
+      let gas;
+      if (DEFAULT_INSTANCE_METHODS_TO_OVERRIDE.includes(methodName)) {
+        const txArgs = args[args.length - 1];
+        gas = await pweb3.eth.estimateGas({ ...txArgs, to: instance.address });
+      } else {
+        gas = await util.promisify(instance.contract[methodName].estimateGas)(
+          ...args
+        );
+      }
+
+      console.log("Estimation", methodName, gas);
+
+      return Math.round(gas * DEFAULT_GAS_MULTIPLIER);
     };
   }
 
